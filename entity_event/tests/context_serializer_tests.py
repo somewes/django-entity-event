@@ -1,9 +1,11 @@
 import json
+from django import VERSION
 from django.test.testcases import TransactionTestCase
 from django_dynamic_fixture import G
 from mock import patch, call
 
 from entity_event.context_serializer import DefaultContextSerializer
+from entity_event.tests.models import TestModel
 
 
 class DefaultContextSerializerTests(TransactionTestCase):
@@ -53,8 +55,6 @@ class DefaultContextSerializerTests(TransactionTestCase):
         self.assertEqual(response, 'test')
 
     def test_serialize_model(self):
-        from entity_event.tests.models import TestModel
-
         # Create a model to test with
         model = G(TestModel)
 
@@ -63,6 +63,9 @@ class DefaultContextSerializerTests(TransactionTestCase):
 
         # Call the method
         response = self.serializer.serialize_model(model)
+
+        # Evaluate the fk_m2m because later djangos return a queryset
+        response['fk_m2m'] = list(response['fk_m2m'])
 
         # Assert that we have a proper response
         self.assertEqual(
