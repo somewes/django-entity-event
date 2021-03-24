@@ -349,46 +349,233 @@ class Medium(models.Model):
         # Get the filtered events
         events = self.get_filtered_events(**event_filters)
 
-        # Get all subscriptions associated with this medium
-        subscriptions = Subscription.objects.filter(medium=self).select_related('entity')
+        # Short circuit
+        if not events.exists():
+            return []
 
-        # Build a cache of entities that are subscribed for each subscription
+        # Build a cache of subscribed entities based on entity_id + entity_kind_id tuple
+        # Dict of tuple(entity_id, entity_kind_id) to set of entity ids
         subscribed_cache = {}
-        for sub in subscriptions:
-            subscribed_cache[sub.id] = sub.subscribed_entities()
+
+        # Get subscriptions for this medium
+        all_subscriptions = list(Subscription.objects.filter(medium=self))
+
+        # Short circuit
+        if not all_subscriptions:
+            return []
+
+        # Separate subscription types
+        single_entity_subscriptions = []
+        subs_of_super_subscriptions = []
+        for subscription in all_subscriptions:
+            if subscription.sub_entity_kind_id:
+                subs_of_super_subscriptions.append(subscription)
+            else:
+                single_entity_subscriptions.append(subscription)
+
+        # Single entity subscriptions don't need additional fetching
+        for single_entity_subscription in single_entity_subscriptions:
+            key = self.get_subscription_key(single_entity_subscription)
+            subscribed_cache[key] = {single_entity_subscription.entity_id}
+
+        # Build set of entity + entity kind we need to fetch sub ids for
+        entity_kind_sub_entity_pairs = {
+            (subs_of_super_subscription.entity_id, subs_of_super_subscription.entity_kind_id)
+            for subs_of_super_subscription in subs_of_super_subscriptions
+        }
+
+        # Get entity_kind + super entity cache of sub entities
+        entities_by_kind = self.get_entities_by_kind(entity_kind_sub_entity_pairs)
+
+        # Add these entity id sets to the subscription cache
+        for subs_of_super_subscription in subs_of_super_subscriptions:
+            key = self.get_subscription_key(subs_of_super_subscription)
+            subscribed_cache[key] = entities_by_kind.get(
+                subs_of_super_subscription.entity_kind_id, {}
+            ).get(
+                subs_of_super_subscription.entity_id, set()
+            )
+
+        # Build event actor cache - actors include subs of all super entities
+        event_ids = {event.id for event in events}
+        event_actors = list(EventActor.objects.filter(event_id__in=event_ids).values_list('event_id', 'entity_id'))
+        event_id_to_actor_ids = defaultdict(set)
+        all_actor_ids = set()
+        for event_actor in event_actors:
+            all_actor_ids.add(event_actor[1])
+            event_id_to_actor_ids[event_actor[0]].add(event_actor[1])
+
+        # Fetch all sub entities of the event actors
+        relationships = EntityRelationship.objects.filter(super_entity_id__in=all_actor_ids).values_list(
+            'super_entity_id',
+            'sub_entity_id'
+        )
+
+        # Build cache of super entity id to sub entity id sets
+        super_id_to_sub_ids = defaultdict(set)
+        for relationship in relationships:
+            super_id_to_sub_ids[relationship[0]].add(relationship[1])
+
+        # Add the sub entities to the actor sets
+        # Loop over each event + actor id set
+        for event_id, actor_ids in event_id_to_actor_ids.items():
+
+            # Loop over each super + sub id set
+            for super_entity_id, sub_entity_ids in super_id_to_sub_ids.items():
+
+                # Check if this super entity is an actor in this event
+                if super_entity_id in actor_ids:
+
+                    # Add all the sub entities to the actor list
+                    event_id_to_actor_ids[event_id].update(sub_entity_ids)
+
+        # Get the unsubscriptions
+        unsubscriptions = defaultdict(set)
+        for unsubscription in Unsubscription.objects.filter(medium=self).values_list('source_id', 'entity_id'):
+            unsubscriptions[unsubscription[0]].add(unsubscription[1])
 
         # Build the event target pairs
         event_pairs = []
         for event in events:
-            targets = []
-            for sub in subscriptions:
-                if event.source_id != sub.source_id:
+            actor_ids = event_id_to_actor_ids[event.id]
+
+            target_entities = set()
+            for subscription in all_subscriptions:
+                if event.source_id != subscription.source_id:
                     continue
 
-                subscribed = subscribed_cache[sub.id]
+                # Get set of subscribed entity ids
+                subscribed_entity_ids = subscribed_cache[self.get_subscription_key(subscription)]
 
-                if sub.only_following:
-                    potential_targets = self.followers_of(
-                        event.eventactor_set.values_list('entity__id', flat=True)
-                    )
-                    subscription_targets = list(Entity.objects.filter(
-                        Q(id__in=subscribed),
-                        Q(id__in=potential_targets)
-                    ))
+                if subscription.only_following:
+                    target_entities.update(subscribed_entity_ids & actor_ids)
                 else:
-                    subscription_targets = list(subscribed)
+                    target_entities.update(subscribed_entity_ids)
 
-                targets.extend(subscription_targets)
+            # Filter target_entities by unsubscriptions
+            target_entities = [
+                target_entity
+                for target_entity in target_entities
+                if target_entity.id not in unsubscriptions[event.source_id]
+            ]
 
-            targets = self.filter_source_targets_by_unsubscription(event.source_id, targets)
-
+            # Filter target_entities by entity kind
             if entity_kind:
-                targets = [t for t in targets if t.entity_kind == entity_kind]
-            if targets:
-                event_pairs.append((event, targets))
+                target_entities = [
+                    target_entity
+                    for target_entity in target_entities
+                    if target_entity.entity_kind_id == entity_kind.id
+                ]
 
-        # Return the event pairs
+            if target_entities:
+                event_pairs.append((event, target_entities))
+
         return event_pairs
+
+        # targets = []
+        #
+        # # Get all subscriptions associated with this medium
+        # subscriptions = Subscription.objects.filter(medium=self).select_related('entity')
+        #
+        # # Build a cache of entities that are subscribed for each subscription
+        # subscribed_cache = {}
+        # for sub in subscriptions:
+        #     subscribed_cache[sub.id] = sub.subscribed_entities()
+        #
+        # # Build the event target pairs
+        # event_pairs = []
+        # for event in events:
+        #     targets = []
+        #     for sub in subscriptions:
+        #         if event.source_id != sub.source_id:
+        #             continue
+        #
+        #         subscribed = subscribed_cache[sub.id]
+        #
+        #         if sub.only_following:
+        #             potential_targets = self.followers_of(
+        #                 event.eventactor_set.values_list('entity__id', flat=True)
+        #             )
+        #             subscription_targets = list(Entity.objects.filter(
+        #                 Q(id__in=subscribed),
+        #                 Q(id__in=potential_targets)
+        #             ))
+        #         else:
+        #             subscription_targets = list(subscribed)
+        #
+        #         targets.extend(subscription_targets)
+        #
+        #     targets = self.filter_source_targets_by_unsubscription(event.source_id, targets)
+        #
+        #     if entity_kind:
+        #         targets = [t for t in targets if t.entity_kind == entity_kind]
+        #     if targets:
+        #         event_pairs.append((event, targets))
+        #
+        # # Return the event pairs
+        # return event_pairs
+
+    def get_subscription_key(self, subscription):
+        return subscription.entity_id, subscription.entity_kind_id
+
+    def get_entities_by_kind(self, entity_kind_sub_entity_pairs):
+        """
+        Example structure:
+        {
+            entity_kind_id: {
+                entity1_id: [1, 2, 3],
+                entity2_id: [4, 5, 6],
+                'all': [1, 2, 3, 4, 5, 6]
+            }
+        }
+        """
+        entities_by_kind = {}
+        kinds_with_all = set()
+        kinds_with_supers = set()
+        super_ids = set()
+
+        # Look at each membership
+        for entity_id, entity_kind_id in entity_kind_sub_entity_pairs:
+
+            # Only care about memberships with entity kind
+            if entity_kind_id:
+
+                # Make sure a dict exists for this kind
+                entities_by_kind.setdefault(entity_kind_id, {})
+
+                # Check if this is all entities of a kind under a specific entity
+                if entity_id:
+                    entities_by_kind[entity_kind_id][entity_id] = set()
+                    kinds_with_supers.add(entity_kind_id)
+                    super_ids.add(entity_id)
+                else:
+                    # This is all entities of this kind
+                    entities_by_kind[entity_kind_id]['all'] = set()
+                    kinds_with_all.add(entity_kind_id)
+
+        # Get entities for 'all'
+        all_entities_for_types = Entity.objects.filter(
+            entity_kind_id__in=kinds_with_all
+        ).values_list('id', 'entity_kind_id')
+
+        # Add entity ids to entity kind's all list
+        for id, entity_kind_id in all_entities_for_types:
+            entities_by_kind[entity_kind_id]['all'].add(id)
+
+        # Get relationships
+        relationships = EntityRelationship.objects.filter(
+            super_entity_id__in=super_ids,
+            sub_entity__entity_kind_id__in=kinds_with_supers
+        ).values_list(
+            'super_entity_id', 'sub_entity_id', 'sub_entity__entity_kind_id'
+        )
+
+        # Add entity ids to each super entity's list
+        for super_entity_id, sub_entity_id, sub_entity__entity_kind_id in relationships:
+            entities_by_kind[sub_entity__entity_kind_id].setdefault(super_entity_id, set())
+            entities_by_kind[sub_entity__entity_kind_id][super_entity_id].add(sub_entity_id)
+
+        return entities_by_kind
 
     def subset_subscriptions(self, subscriptions, entity=None):
         """
