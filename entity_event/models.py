@@ -380,7 +380,7 @@ class Medium(models.Model):
 
         # Build set of entity + entity kind we need to fetch sub ids for
         entity_kind_sub_entity_pairs = {
-            (subs_of_super_subscription.entity_id, subs_of_super_subscription.entity_kind_id)
+            (subs_of_super_subscription.entity_id, subs_of_super_subscription.sub_entity_kind_id)
             for subs_of_super_subscription in subs_of_super_subscriptions
         }
 
@@ -391,7 +391,7 @@ class Medium(models.Model):
         for subs_of_super_subscription in subs_of_super_subscriptions:
             key = self.get_subscription_key(subs_of_super_subscription)
             subscribed_cache[key] = entities_by_kind.get(
-                subs_of_super_subscription.entity_kind_id, {}
+                subs_of_super_subscription.sub_entity_kind_id, {}
             ).get(
                 subs_of_super_subscription.entity_id, set()
             )
@@ -456,16 +456,16 @@ class Medium(models.Model):
             target_entities = [
                 target_entity
                 for target_entity in target_entities
-                if target_entity.id not in unsubscriptions[event.source_id]
+                if target_entity not in unsubscriptions[event.source_id]
             ]
 
             # Filter target_entities by entity kind
-            if entity_kind:
-                target_entities = [
-                    target_entity
-                    for target_entity in target_entities
-                    if target_entity.entity_kind_id == entity_kind.id
-                ]
+            # if entity_kind:
+            #     target_entities = [
+            #         target_entity
+            #         for target_entity in target_entities
+            #         if target_entity.entity_kind_id == entity_kind.id
+            #     ]
 
             if target_entities:
                 event_pairs.append((event, target_entities))
@@ -516,7 +516,7 @@ class Medium(models.Model):
         # return event_pairs
 
     def get_subscription_key(self, subscription):
-        return subscription.entity_id, subscription.entity_kind_id
+        return subscription.entity_id, subscription.sub_entity_kind_id
 
     def get_entities_by_kind(self, entity_kind_sub_entity_pairs):
         """
